@@ -1,553 +1,590 @@
 <?php
 session_start();
-require_once 'includes/db.php';
+require_once 'db.php';
 
-// --- Helper Functions ---
-
-// Function to generate IDs manually since schema doesn't specify AUTO_INCREMENT
-function getNextId($pdo, $table, $column) {
-    $stmt = $pdo->query("SELECT MAX($column) as max_id FROM $table");
-    $row = $stmt->fetch();
-    return ($row['max_id'] ?? 0) + 1;
-}
-
-// Check Login State
-$is_logged_in = isset($_SESSION['user_id']);
-$current_user_id = $_SESSION['user_id'] ?? 0;
-$current_username = $_SESSION['username'] ?? 'Guest';
-
-// Initialize Variables
-$mode = 'create'; // create, view, edit
-$quiz_data = [
-    'title' => '',
-    'description' => '',
-    'is_public' => 0,
-    'quiz_id' => null,
-    'user_id' => 0
-];
-$prompt_data = '';
-$pairs_data = [];
-$error_msg = '';
-$success_msg = '';
-
+// Helpers
+function h($s){ return htmlspecialchars($s, ENT_QUOTES); }
 $pdo = getDBConnection();
 
-// --- POST REQUEST HANDLING (Save/Delete) ---
+$user_id = $_SESSION['user_id'] ?? null;
+$username = $_SESSION['username'] ?? 'Guest';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_POST['action']) && $_POST['action'] === 'save_quiz') {
-        if (!$is_logged_in) {
-            header("Location: pages/login.php");
-            exit;
+// Load lists for sidebar
+// My Tests (only if logged in)
+$myTests = [];
+if ($user_id) {
+    $stmt = $pdo->prepare("SELECT q.quiz_id, q.title, q.description,
+        (SELECT COUNT(*) FROM question qu JOIN matching_pairs mp ON qu.question_id = mp.question_id WHERE qu.quiz_id = q.quiz_id GROUP BY qu.quiz_id) AS num_questions
+        FROM quiz q
+        WHERE q.user_id = ?
+        ORDER BY q.created_at DESC");
+    $stmt->execute([$user_id]);
+    $myTests = $stmt->fetchAll();
+}
+
+// Public tests
+$publicTests = [];
+$stmt = $pdo->prepare("SELECT q.quiz_id, q.title, q.description,
+    (SELECT COUNT(*) FROM question qu JOIN matching_pairs mp ON qu.question_id = mp.question_id WHERE qu.quiz_id = q.quiz_id GROUP BY qu.quiz_id) AS num_questions
+    FROM quiz q
+    WHERE q.is_public = 1
+    ORDER BY q.created_at DESC");
+$stmt->execute();
+$publicTests = $stmt->fetchAll();
+
+// Determine selected quiz and mode
+$quiz_id = isset($_GET['quiz_id']) ? intval($_GET['quiz_id']) : null;
+$mode = $_GET['mode'] ?? 'create'; // create, view, edit
+
+$editing_quiz = null;
+$question = null;
+$pairs = [];
+
+if ($quiz_id) {
+    // load quiz
+    $stmt = $pdo->prepare("SELECT * FROM quiz WHERE quiz_id = ?");
+    $stmt->execute([$quiz_id]);
+    $editing_quiz = $stmt->fetch();
+
+    // load question (assuming one question row per quiz)
+    if ($editing_quiz) {
+        $stmt = $pdo->prepare("SELECT * FROM question WHERE quiz_id = ? LIMIT 1");
+        $stmt->execute([$quiz_id]);
+        $question = $stmt->fetch();
+
+        if ($question) {
+            // load pairs ordered by position (or pair_id)
+            $stmt = $pdo->prepare("SELECT * FROM matching_pairs WHERE question_id = ? ORDER BY pair_id ASC");
+            $stmt->execute([$question['question_id']]);
+            $pairs = $stmt->fetchAll();
         }
+    }
+}
+
+// Handle create/save new quiz
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_new') {
+    // Save new quiz (Create Mode)
+    $title = trim($_POST['title'] ?? '');
+    $description = trim($_POST['description'] ?? '');
+    $user_prompt = trim($_POST['user_prompt'] ?? '');
+    $is_public = isset($_POST['is_public']) && $_POST['is_public'] == '1' ? 1 : 0;
+
+    // pairs arrays
+    $lefts = $_POST['left'] ?? [];
+    $rights = $_POST['right'] ?? [];
+
+    if (!$user_id) {
+        // guest -> redirect to login page
+        header("Location: pages/login.php");
+        exit();
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        $stmt = $pdo->prepare("INSERT INTO quiz (user_id, title, description, is_public) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$user_id, $title, $description, $is_public]);
+        $new_quiz_id = $pdo->lastInsertId();
+
+        // insert question (single)
+        $stmt = $pdo->prepare("INSERT INTO question (quiz_id, user_prompt) VALUES (?, ?)");
+        $stmt->execute([$new_quiz_id, $user_prompt]);
+        $new_question_id = $pdo->lastInsertId();
+
+        // insert pairs
+        $pos = 1;
+        $mpStmt = $pdo->prepare("INSERT INTO matching_pairs (question_id, left_text, right_text, position) VALUES (?, ?, ?, ?)");
+        for ($i = 0; $i < count($lefts); $i++) {
+            $l = trim($lefts[$i]);
+            $r = trim($rights[$i]);
+            if ($l === '' && $r === '') continue;
+            $mpStmt->execute([$new_question_id, $l, $r, (string)$pos]);
+            $pos++;
+        }
+
+        $pdo->commit();
+        // Redirect to view mode for new quiz
+        header("Location: index.php?quiz_id=" . intval($new_quiz_id) . "&mode=view");
+        exit();
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $error = "Save failed: " . $e->getMessage();
+    }
+}
+
+// Handle edit-save update
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_edit' && isset($_POST['quiz_id'])) {
+    $quizId = intval($_POST['quiz_id']);
+    // Ensure current user is owner
+    $stmt = $pdo->prepare("SELECT user_id FROM quiz WHERE quiz_id = ?");
+    $stmt->execute([$quizId]);
+    $owner = $stmt->fetchColumn();
+    if (!$owner || $owner != $user_id) {
+        $error = "Not authorized to edit this quiz.";
+    } else {
+        $title = trim($_POST['title'] ?? '');
+        $description = trim($_POST['description'] ?? '');
+        $user_prompt = trim($_POST['user_prompt'] ?? '');
+        $is_public = isset($_POST['is_public']) && $_POST['is_public'] == '1' ? 1 : 0;
+        $lefts = $_POST['left'] ?? [];
+        $rights = $_POST['right'] ?? [];
 
         try {
             $pdo->beginTransaction();
+            $stmt = $pdo->prepare("UPDATE quiz SET title = ?, description = ?, is_public = ? WHERE quiz_id = ?");
+            $stmt->execute([$title, $description, $is_public, $quizId]);
 
-            $title = $_POST['title'];
-            $desc = $_POST['description'];
-            $prompt = $_POST['user_prompt'];
-            $is_public = isset($_POST['is_public']) ? 0 : 1; // Checkbox checked = private (0) per prompt logic? 
-            // Prompt says: Col 1: "Private" Checkbox. If checked, is_public = 0.
-            $is_public_val = isset($_POST['is_private']) ? 0 : 1;
-
-            $quiz_id = $_POST['quiz_id'] ?? null;
-
-            if ($quiz_id) {
-                // Update Existing
-                $stmt = $pdo->prepare("UPDATE quiz SET title=?, description=?, is_public=? WHERE quiz_id=? AND user_id=?");
-                $stmt->execute([$title, $desc, $is_public_val, $quiz_id, $current_user_id]);
-                
-                // For simplicity in this scope, we wipe questions/pairs and recreate them on edit
-                // Real-world apps should update specific IDs to preserve stats, but schema lacks cascading deletes 
-                // We will just update the Question text and handle pairs carefully.
-                $stmt = $pdo->prepare("UPDATE question SET user_prompt=? WHERE quiz_id=?");
-                $stmt->execute([$prompt, $quiz_id]);
-                
-                // Get Question ID
-                $stmt = $pdo->prepare("SELECT question_id FROM question WHERE quiz_id=?");
-                $stmt->execute([$quiz_id]);
-                $qid = $stmt->fetchColumn();
-                
-                // Delete old pairs
-                $stmt = $pdo->prepare("DELETE FROM matching_pairs WHERE question_id=?");
-                $stmt->execute([$qid]);
-                
-                $current_q_id = $qid;
-
+            // update/insert question
+            $stmt = $pdo->prepare("SELECT question_id FROM question WHERE quiz_id = ? LIMIT 1");
+            $stmt->execute([$quizId]);
+            $qId = $stmt->fetchColumn();
+            if ($qId) {
+                $stmt = $pdo->prepare("UPDATE question SET user_prompt = ? WHERE question_id = ?");
+                $stmt->execute([$user_prompt, $qId]);
+                // Delete old pairs and re-insert to keep it simple
+                $stmt = $pdo->prepare("DELETE FROM matching_pairs WHERE question_id = ?");
+                $stmt->execute([$qId]);
             } else {
-                // Insert New Quiz
-                $quiz_id = getNextId($pdo, 'quiz', 'quiz_id');
-                $stmt = $pdo->prepare("INSERT INTO quiz (quiz_id, user_id, title, description, is_public) VALUES (?, ?, ?, ?, ?)");
-                $stmt->execute([$quiz_id, $current_user_id, $title, $desc, $is_public_val]);
-
-                // Insert Question
-                $current_q_id = getNextId($pdo, 'question', 'question_id');
-                $stmt = $pdo->prepare("INSERT INTO question (question_id, quiz_id, user_prompt) VALUES (?, ?, ?)");
-                $stmt->execute([$current_q_id, $quiz_id, $prompt]);
+                $stmt = $pdo->prepare("INSERT INTO question (quiz_id, user_prompt) VALUES (?, ?)");
+                $stmt->execute([$quizId, $user_prompt]);
+                $qId = $pdo->lastInsertId();
             }
 
-            // Insert Pairs
-            if (isset($_POST['left_text']) && isset($_POST['right_text'])) {
-                $lefts = $_POST['left_text'];
-                $rights = $_POST['right_text'];
-                
-                for ($i = 0; $i < count($lefts); $i++) {
-                    if (!empty($lefts[$i]) && !empty($rights[$i])) {
-                        $pair_id = getNextId($pdo, 'matching_pairs', 'pair_id');
-                        $stmt = $pdo->prepare("INSERT INTO matching_pairs (pair_id, question_id, left_text, right_text, position) VALUES (?, ?, ?, ?, ?)");
-                        // Position logic: just storing generic 'LR' as schema requires a varchar(2)
-                        $stmt->execute([$pair_id, $current_q_id, $lefts[$i], $rights[$i], 'LR']); 
-                    }
-                }
+            $mpStmt = $pdo->prepare("INSERT INTO matching_pairs (question_id, left_text, right_text, position) VALUES (?, ?, ?, ?)");
+            $pos = 1;
+            for ($i = 0; $i < count($lefts); $i++) {
+                $l = trim($lefts[$i]);
+                $r = trim($rights[$i]);
+                if ($l === '' && $r === '') continue;
+                $mpStmt->execute([$qId, $l, $r, (string)$pos]);
+                $pos++;
             }
 
             $pdo->commit();
-            header("Location: index.php?quiz_id=" . $quiz_id . "&mode=view");
-            exit;
-
+            header("Location: index.php?quiz_id=" . intval($quizId) . "&mode=view");
+            exit();
         } catch (Exception $e) {
             $pdo->rollBack();
-            $error_msg = "Error saving: " . $e->getMessage();
+            $error = "Update failed: " . $e->getMessage();
         }
     }
 }
 
-// --- GET REQUEST HANDLING (Load Data) ---
+// Handle taking the quiz (Done button in view mode) - store attempt
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'submit_attempt' && isset($_POST['quiz_id'])) {
+    $quizId = intval($_POST['quiz_id']);
+    // gather user choices: expecting inputs named choice_left_{left_pair_id} => right_pair_id
+    $answers = [];
+    foreach ($_POST as $k => $v) {
+        if (strpos($k, 'choice_left_') === 0) {
+            $left_pair_id = intval(substr($k, strlen('choice_left_')));
+            $chosen_right_pair_id = intval($v);
+            $answers[$left_pair_id] = $chosen_right_pair_id;
+        }
+    }
 
-// 1. Fetch Sidebar Data
-$my_tests = [];
-$public_tests = [];
+    // if no user_id, set null (guests can attempt but we store user_id null)
+    $attempt_user_id = $user_id ?? null;
 
-if ($is_logged_in) {
-    $stmt = $pdo->prepare("SELECT quiz_id, title, (SELECT COUNT(*) FROM matching_pairs mp JOIN question q ON mp.question_id = q.question_id WHERE q.quiz_id = quiz.quiz_id) as q_count FROM quiz WHERE user_id = ? ORDER BY created_at DESC");
-    $stmt->execute([$current_user_id]);
-    $my_tests = $stmt->fetchAll();
+    try {
+        $pdo->beginTransaction();
+
+        // score calculation: each left where chosen_right_pair_id == left_pair_id is correct
+        $score = 0;
+        $total = count($answers);
+
+        // fetch correct mapping for lefts
+        // matching_pairs(pair_id, left_text, right_text, question_id)
+        $mpStmt = $pdo->prepare("SELECT pair_id FROM matching_pairs WHERE question_id = (SELECT question_id FROM question WHERE quiz_id = ? LIMIT 1)");
+        $mpStmt->execute([$quizId]);
+        $validPairs = $mpStmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        foreach ($answers as $left_pid => $chosen_right_pid) {
+            if ($left_pid === $chosen_right_pid) $score++;
+        }
+
+        // store attempt
+        $stmt = $pdo->prepare("INSERT INTO attempts (user_id, quiz_id, score) VALUES (?, ?, ?)");
+        $stmt->execute([$attempt_user_id, $quizId, $score]);
+        $attempt_id = $pdo->lastInsertId();
+
+        // store attempt answers
+        $insertAA = $pdo->prepare("INSERT INTO attempt_answer (attempt_id, pair_id, chosen_text, is_correct) VALUES (?, ?, ?, ?)");
+        foreach ($answers as $left_pid => $chosen_right_pid) {
+            // get chosen right text
+            $stmt = $pdo->prepare("SELECT right_text FROM matching_pairs WHERE pair_id = ?");
+            $stmt->execute([$chosen_right_pid]);
+            $chosen_text = $stmt->fetchColumn();
+            $is_correct = ($left_pid === $chosen_right_pid) ? 1 : 0;
+            $insertAA->execute([$attempt_id, $left_pid, $chosen_text, $is_correct]);
+        }
+
+        $pdo->commit();
+        $success = "Attempt saved. Score: {$score} / {$total}";
+        // After submit, show view mode again
+        header("Location: index.php?quiz_id=$quizId&mode=view&msg=" . urlencode($success));
+        exit();
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $error = "Attempt save failed: " . $e->getMessage();
+    }
 }
 
-$stmt = $pdo->query("SELECT quiz_id, title, (SELECT COUNT(*) FROM matching_pairs mp JOIN question q ON mp.question_id = q.question_id WHERE q.quiz_id = quiz.quiz_id) as q_count FROM quiz WHERE is_public = 1 ORDER BY created_at DESC");
-$public_tests = $stmt->fetchAll();
-
-// 2. Determine Mode & Load Workspace Data
-if (isset($_GET['quiz_id'])) {
-    $req_qid = $_GET['quiz_id'];
-    $req_mode = $_GET['mode'] ?? 'view';
-
-    // Fetch Quiz Info
+// Re-load updated data if we saved
+if ($quiz_id) {
     $stmt = $pdo->prepare("SELECT * FROM quiz WHERE quiz_id = ?");
-    $stmt->execute([$req_qid]);
-    $fetched_quiz = $stmt->fetch();
-
-    if ($fetched_quiz) {
-        $quiz_data = $fetched_quiz;
-        
-        // Fetch Prompt
-        $stmt = $pdo->prepare("SELECT * FROM question WHERE quiz_id = ?");
-        $stmt->execute([$req_qid]);
-        $q_data = $stmt->fetch();
-        $prompt_data = $q_data['user_prompt'] ?? '';
-        $q_db_id = $q_data['question_id'] ?? 0;
-
-        // Fetch Pairs
-        $stmt = $pdo->prepare("SELECT * FROM matching_pairs WHERE question_id = ?");
-        $stmt->execute([$q_db_id]);
-        $pairs_data = $stmt->fetchAll();
-
-        // Access Control
-        if ($req_mode === 'edit') {
-            if ($fetched_quiz['user_id'] == $current_user_id) {
-                $mode = 'edit';
-            } else {
-                $mode = 'view'; // Fallback if trying to edit someone else's test
-            }
-        } else {
-            $mode = 'view';
+    $stmt->execute([$quiz_id]);
+    $editing_quiz = $stmt->fetch();
+    if ($editing_quiz) {
+        $stmt = $pdo->prepare("SELECT * FROM question WHERE quiz_id = ? LIMIT 1");
+        $stmt->execute([$quiz_id]);
+        $question = $stmt->fetch();
+        if ($question) {
+            $stmt = $pdo->prepare("SELECT * FROM matching_pairs WHERE question_id = ? ORDER BY pair_id ASC");
+            $stmt->execute([$question['question_id']]);
+            $pairs = $stmt->fetchAll();
         }
     }
 }
 
-// --- VIEW LOGIC: Shuffling for Take Mode ---
-$left_col_items = $pairs_data;
-$right_col_items = $pairs_data;
-
-if ($mode === 'view') {
-    shuffle($right_col_items);
+// For view mode: prepare shuffled right side
+$shuffled_right = [];
+if ($mode === 'view' && !empty($pairs)) {
+    $shuffled_right = $pairs;
+    // shuffle while preserving pair_id
+    shuffle($shuffled_right);
 }
 
 ?>
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PHP Quiz Dashboard</title>
-    <style>
-        /* CSS Reset & Basics */
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        body { height: 100vh; overflow: hidden; display: flex; background-color: #f4f4f9; }
+<meta charset="utf-8">
+<title>Quiz Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    :root{--sidebar-width:320px;--gap:12px;--accent:#2563eb}
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    .container{display:flex;height:100vh;}
+    /* Column 1 (Sidebar) */
+    .sidebar{width:var(--sidebar-width);min-width:260px;background:#f5f7fb;padding:16px;box-sizing:border-box;display:flex;flex-direction:column;gap:var(--gap)}
+    .sidebar .row{background:white;padding:12px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+    .user-row{height:10vh;display:flex;align-items:center;justify-content:center;font-weight:600}
+    .list-row{overflow:auto}
+    .test-button{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin:6px 0;border-radius:6px;border:1px solid #e6e9f0;background:transparent;cursor:pointer;}
+    .test-button:hover{background:#eef2ff}
+    .test-button a{display:block;text-decoration:none;color:inherit;width:100%}
+    .test-title{font-weight:600}
+    .test-count{font-size:0.85rem;color:#666}
 
-        /* --- Column 1: Sidebar --- */
-        .sidebar {
-            width: 25%;
-            min-width: 250px;
-            height: 100vh;
-            background-color: #2c3e50;
-            color: white;
-            display: flex;
-            flex-direction: column;
-            border-right: 1px solid #1a252f;
-        }
+    /* Column 2 (Main) */
+    .main{flex:1;padding:18px;box-sizing:border-box;display:flex;flex-direction:column;gap:var(--gap)}
+    .main .row{background:white;padding:12px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+    .title-row{height:auto}
+    .desc-row{height:140px}
+    .prompt-row{height:64px}
+    .qa-row{flex:1;overflow:auto}
+    .add-row{height:48px;display:flex;align-items:center}
+    .actions-row{height:60px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 
-        .sb-row-1 {
-            height: 10%;
-            display: flex;
-            align-items: center;
-            padding: 0 20px;
-            background-color: #34495e;
-            font-weight: bold;
-            font-size: 1.2rem;
-            border-bottom: 1px solid #1abc9c;
-        }
+    input[type="text"], textarea {width:100%;padding:8px;border:1px solid #d7dbe8;border-radius:6px;font-size:1rem;box-sizing:border-box}
+    textarea[readonly], input[readonly] {background:#f7f9fc}
+    .pair-row{display:flex;gap:10px;margin-bottom:8px}
+    .pair-row input{width:100%}
+    .pairs-columns{display:flex;gap:10px}
+    .pairs-columns > div{flex:1}
+    .small{font-size:0.9rem;color:#444}
+    .btn{padding:8px 12px;border-radius:6px;border:none;cursor:pointer}
+    .btn-primary{background:var(--accent);color:white}
+    .btn-ghost{background:transparent;border:1px solid #cfd6ef}
+    .checkbox{display:flex;align-items:center;gap:6px}
 
-        .sb-header { padding: 10px 20px; background: #22313f; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #bdc3c7; }
-        
-        .sb-list-container {
-            flex: 1; /* Takes remaining space roughly split */
-            height: 45%; 
-            overflow-y: auto;
-        }
+    /* View mode special layout */
+    .view-qa{display:flex;gap:10px}
+    .view-left,.view-right{flex:1;background:transparent;padding:8px;border-radius:6px}
+    .view-item{display:flex;align-items:center;justify-content:space-between;padding:8px;border-radius:6px;border:1px solid #eef2ff;margin-bottom:8px;background:#fff}
+    .radio-area{width:10%;text-align:center}
+    .text-area{width:90%}
+    .flex-row{display:flex;gap:8px;align-items:center}
+    .muted{color:#666;font-size:0.9rem}
 
-        .quiz-btn {
-            display: block;
-            width: 100%;
-            padding: 15px 20px;
-            background: none;
-            border: none;
-            border-bottom: 1px solid #34495e;
-            color: #ecf0f1;
-            text-align: left;
-            cursor: pointer;
-            transition: 0.2s;
-        }
-        .quiz-btn:hover { background-color: #34495e; }
-        .quiz-meta { font-size: 0.8rem; color: #95a5a6; display: block; margin-top: 5px; }
-
-        /* --- Column 2: Main Workspace --- */
-        .workspace {
-            flex: 1;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            background-color: white;
-            padding: 20px;
-        }
-
-        /* Rows */
-        .ws-row { margin-bottom: 15px; }
-        
-        /* Row 1: Title */
-        #input-title {
-            width: 100%;
-            font-size: 1.5rem;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            resize: none;
-            height: 60px; /* Fits standard text */
-        }
-
-        /* Row 2: Description */
-        #input-desc {
-            width: 100%;
-            height: 80px;
-            padding: 10px;
-            border: 1px solid #ddd;
-            resize: none;
-            font-size: 0.95rem;
-        }
-
-        /* Row 3: User Prompt */
-        #input-prompt {
-            width: 100%;
-            height: 50px;
-            padding: 10px;
-            border: 1px solid #ddd;
-            resize: none;
-            background-color: #fcf8e3;
-            color: #8a6d3b;
-        }
-
-        /* Row 4: Q&A Pairs */
-        .qa-container {
-            flex: 1; /* Takes remaining height */
-            overflow-y: auto;
-            border: 1px solid #eee;
-            padding: 10px;
-            margin-bottom: 10px;
-            background: #fafafa;
-        }
-
-        /* Layouts for Q&A */
-        .pair-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
-        
-        /* Edit/Create Layout */
-        .edit-layout .input-q, .edit-layout .input-a {
-            width: 50%;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-        }
-
-        /* View Layout (Shuffled) */
-        .view-layout { display: flex; gap: 20px; height: 100%; }
-        .col-left, .col-right { flex: 1; display: flex; flex-direction: column; gap: 10px; }
-        
-        .view-item {
-            display: flex;
-            align-items: center;
-            background: white;
-            border: 1px solid #ddd;
-            min-height: 50px;
-        }
-        
-        /* Left: 90% Text / 10% Radio */
-        .left-item .text-part { width: 90%; padding: 10px; border-right: 1px solid #eee; }
-        .left-item .radio-part { width: 10%; display: flex; justify-content: center; background: #eee; height: 100%; align-items: center; cursor: pointer; }
-        
-        /* Right: 10% Radio / 90% Text */
-        .right-item .radio-part { width: 10%; display: flex; justify-content: center; background: #eee; height: 100%; align-items: center; cursor: pointer; }
-        .right-item .text-part { width: 90%; padding: 10px; border-left: 1px solid #eee; }
-
-        .selected-match { background-color: #dff0d8 !important; border-color: #3c763d !important; }
-
-        /* Row 5: Add Button */
-        .add-btn-row { height: 40px; text-align: center; }
-        .btn-add {
-            background-color: #3498db; color: white; border: none; padding: 8px 20px; cursor: pointer; border-radius: 4px;
-        }
-
-        /* Row 6: Actions */
-        .actions-row {
-            height: 60px;
-            display: flex;
-            align-items: center;
-            border-top: 1px solid #eee;
-            padding-top: 10px;
-            justify-content: space-between;
-        }
-
-        .btn { padding: 10px 20px; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; }
-        .btn-save { background-color: #27ae60; color: white; }
-        .btn-take { background-color: #e67e22; color: white; text-decoration: none; display: inline-block;}
-        .btn-edit { background-color: #f39c12; color: white; text-decoration: none; }
-        .btn-done { background-color: #2980b9; color: white; }
-        
-        .hidden { display: none !important; }
-        
-        /* Match connection input hidden */
-        input[type="radio"] { transform: scale(1.5); }
-    </style>
+    /* scrollbars */
+    .list-row::-webkit-scrollbar, .qa-row::-webkit-scrollbar {height:8px;width:8px}
+    .list-row::-webkit-scrollbar-thumb, .qa-row::-webkit-scrollbar-thumb {background:#d6d8e8;border-radius:8px}
+</style>
 </head>
 <body>
-
-    <div class="sidebar">
-        <div class="sb-row-1">
-            <span style="font-size: 0.8em; margin-right: 10px;">👤</span> 
-            <?php echo htmlspecialchars($current_username); ?>
+<div class="container">
+    <aside class="sidebar">
+        <div class="row user-row">
+            <div>
+                <div class="small">User</div>
+                <div style="font-size:1.1rem;margin-top:4px;font-weight:700"><?= h($username) ?></div>
+            </div>
         </div>
 
-        <div class="sb-header">My Tests</div>
-        <div class="sb-list-container">
-            <?php if (empty($my_tests)): ?>
-                <div style="padding:20px; color:#7f8c8d; font-size:0.9em;">No tests created.</div>
+        <div class="row list-row" style="height:45vh;">
+            <div style="font-weight:700;margin-bottom:8px">My Tests</div>
+            <?php if (empty($myTests)): ?>
+                <div class="muted">No tests yet.</div>
             <?php else: ?>
-                <?php foreach($my_tests as $test): ?>
-                    <button class="quiz-btn" onclick="window.location.href='index.php?quiz_id=<?php echo $test['quiz_id']; ?>&mode=view'">
-                        <div><?php echo htmlspecialchars($test['title']); ?></div>
-                        <span class="quiz-meta"><?php echo $test['q_count']; ?> Questions</span>
-                    </button>
+                <?php foreach($myTests as $t): ?>
+                    <div class="test-button">
+                        <a href="index.php?quiz_id=<?= intval($t['quiz_id']) ?>&mode=view">
+                            <div class="test-title"><?= h($t['title']) ?></div>
+                            <div class="test-count"><?= intval($t['num_questions'] ?: 0) ?> pairs</div>
+                        </a>
+                    </div>
                 <?php endforeach; ?>
             <?php endif; ?>
         </div>
 
-        <div class="sb-header">Public Tests</div>
-        <div class="sb-list-container">
-            <?php foreach($public_tests as $test): ?>
-                <button class="quiz-btn" onclick="window.location.href='index.php?quiz_id=<?php echo $test['quiz_id']; ?>&mode=view'">
-                    <div><?php echo htmlspecialchars($test['title']); ?></div>
-                    <span class="quiz-meta"><?php echo $test['q_count']; ?> Questions</span>
-                </button>
-            <?php endforeach; ?>
-        </div>
-        
-        <div style="padding: 10px;">
-            <a href="index.php" class="btn" style="background:#95a5a6; color:white; width:100%; display:block; text-align:center; text-decoration:none;">+ Create New</a>
-        </div>
-    </div>
-
-    <div class="workspace">
-        <form id="quizForm" method="POST" action="index.php" style="height:100%; display:flex; flex-direction:column;">
-            <input type="hidden" name="action" value="save_quiz">
-            <input type="hidden" name="quiz_id" value="<?php echo $quiz_data['quiz_id']; ?>">
-
-            <div class="ws-row">
-                <input type="text" id="input-title" name="title" maxlength="50" placeholder="Quiz Title" 
-                    value="<?php echo htmlspecialchars($quiz_data['title']); ?>" 
-                    <?php echo ($mode === 'view') ? 'readonly' : ''; ?> required>
-            </div>
-
-            <div class="ws-row">
-                <textarea id="input-desc" name="description" placeholder="Description..." 
-                    <?php echo ($mode === 'view') ? 'readonly' : ''; ?>><?php echo htmlspecialchars($quiz_data['description']); ?></textarea>
-            </div>
-
-            <div class="ws-row">
-                <textarea id="input-prompt" name="user_prompt" maxlength="100" placeholder="Instructions (e.g., Match the capitals to the countries)" 
-                    <?php echo ($mode === 'view') ? 'readonly' : ''; ?>><?php echo htmlspecialchars($prompt_data); ?></textarea>
-            </div>
-
-            <div class="qa-container">
-                
-                <?php if ($mode === 'view'): ?>
-                    <div class="view-layout">
-                        <div class="col-left">
-                            <?php foreach($left_col_items as $pair): ?>
-                                <div class="view-item left-item" id="L_<?php echo $pair['pair_id']; ?>">
-                                    <div class="text-part"><?php echo htmlspecialchars($pair['left_text']); ?></div>
-                                    <label class="radio-part">
-                                        <input type="radio" name="match_left" value="<?php echo $pair['pair_id']; ?>" onclick="handleMatchSelect('L', <?php echo $pair['pair_id']; ?>)">
-                                    </label>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
-                        
-                        <div class="col-right">
-                            <?php foreach($right_col_items as $pair): ?>
-                                <div class="view-item right-item" id="R_<?php echo $pair['pair_id']; ?>">
-                                    <label class="radio-part">
-                                        <input type="radio" name="match_right" value="<?php echo $pair['pair_id']; ?>" onclick="handleMatchSelect('R', <?php echo $pair['pair_id']; ?>)">
-                                    </label>
-                                    <div class="text-part"><?php echo htmlspecialchars($pair['right_text']); ?></div>
-                                </div>
-                            <?php endforeach; ?>
-                        </div>
+        <div class="row list-row" style="height:45vh;">
+            <div style="font-weight:700;margin-bottom:8px">Public Tests</div>
+            <?php if (empty($publicTests)): ?>
+                <div class="muted">No public tests.</div>
+            <?php else: ?>
+                <?php foreach($publicTests as $t): ?>
+                    <div class="test-button">
+                        <a href="index.php?quiz_id=<?= intval($t['quiz_id']) ?>&mode=view">
+                            <div class="test-title"><?= h($t['title']) ?></div>
+                            <div class="test-count"><?= intval($t['num_questions'] ?: 0) ?> pairs</div>
+                        </a>
                     </div>
-                    <div id="user-matches"></div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+    </aside>
 
-                <?php else: ?>
-                    <div class="edit-layout" id="pairs-wrapper">
-                        <?php if (empty($pairs_data)): ?>
-                            <div class="pair-row">
-                                <input type="text" name="left_text[]" class="input-q" placeholder="Question (Left)" maxlength="100" required>
-                                <input type="text" name="right_text[]" class="input-a" placeholder="Answer (Right)" maxlength="100" required>
-                                <button type="button" onclick="this.parentElement.remove()" style="background:#e74c3c; color:white; border:none; padding:5px 10px; cursor:pointer;">X</button>
+    <main class="main">
+        <!-- Row 1: Title -->
+        <div class="row title-row">
+            <?php if ($mode === 'view' && $editing_quiz): ?>
+                <div style="font-weight:700;font-size:1.1rem"><?= h($editing_quiz['title']) ?></div>
+            <?php else: ?>
+                <form id="mainForm" method="post">
+                    <input type="hidden" name="action" value="<?= $mode === 'edit' ? 'save_edit' : 'save_new' ?>">
+                    <?php if ($mode === 'edit' && $editing_quiz): ?>
+                        <input type="hidden" name="quiz_id" value="<?= intval($editing_quiz['quiz_id']) ?>">
+                    <?php endif; ?>
+                    <label class="small">Title (max 50 chars)</label>
+                    <input type="text" name="title" maxlength="50" required value="<?= h($editing_quiz['title'] ?? '') ?>" <?= $mode === 'view' ? 'readonly' : '' ?>>
+                </form>
+            <?php endif; ?>
+        </div>
+
+        <!-- Row 2: Description -->
+        <div class="row desc-row">
+            <?php if ($mode === 'view' && $editing_quiz): ?>
+                <div class="small">Description</div>
+                <div style="margin-top:8px"><?= nl2br(h($editing_quiz['description'])) ?></div>
+            <?php else: ?>
+                <label class="small">Description</label>
+                <textarea name="description" form="mainForm" rows="6" maxlength="1000" <?= $mode === 'view' ? 'readonly' : '' ?>><?= h($editing_quiz['description'] ?? '') ?></textarea>
+            <?php endif; ?>
+        </div>
+
+        <!-- Row 3: User Prompt -->
+        <div class="row prompt-row">
+            <?php if ($mode === 'view' && $question): ?>
+                <div class="small">Prompt</div>
+                <div style="margin-top:8px"><?= nl2br(h($question['user_prompt'])) ?></div>
+            <?php else: ?>
+                <label class="small">User Prompt (max 100 chars)</label>
+                <textarea name="user_prompt" form="mainForm" rows="2" maxlength="100"><?= h($question['user_prompt'] ?? '') ?></textarea>
+            <?php endif; ?>
+        </div>
+
+        <!-- Row 4: Q&A Pairs -->
+        <div class="row qa-row">
+            <?php if ($mode === 'view' && !empty($pairs)): ?>
+                <!-- VIEW / TAKE MODE: left items (questions) on left, shuffled right items on right
+                     Left side: each left has radio-group to pick a right.
+                     We'll render N x N radio matrix (one group per left).
+                -->
+                <div class="view-qa">
+                    <div class="view-left">
+                        <div class="small" style="margin-bottom:8px">Questions</div>
+                        <?php foreach ($pairs as $left): ?>
+                            <div class="view-item">
+                                <div class="text-area"><?= h($left['left_text']) ?></div>
+                                <div class="radio-area muted">#<?= intval($left['pair_id']) ?></div>
                             </div>
-                        <?php else: ?>
-                            <?php foreach($pairs_data as $pair): ?>
-                                <div class="pair-row">
-                                    <input type="text" name="left_text[]" class="input-q" value="<?php echo htmlspecialchars($pair['left_text']); ?>" maxlength="100" required>
-                                    <input type="text" name="right_text[]" class="input-a" value="<?php echo htmlspecialchars($pair['right_text']); ?>" maxlength="100" required>
-                                    <button type="button" onclick="this.parentElement.remove()" style="background:#e74c3c; color:white; border:none; padding:5px 10px; cursor:pointer;">X</button>
-                                </div>
-                            <?php endforeach; ?>
-                        <?php endif; ?>
+                        <?php endforeach; ?>
                     </div>
-                <?php endif; ?>
-            </div>
 
-            <div class="ws-row add-btn-row <?php echo ($mode === 'view') ? 'hidden' : ''; ?>">
-                <button type="button" class="btn-add" onclick="addNewPair()">+ Add Pair</button>
-            </div>
+                    <div class="view-right">
+                        <div class="small" style="margin-bottom:8px">Answers (shuffled)</div>
+                        <?php foreach ($shuffled_right as $r): ?>
+                            <div class="view-item">
+                                <div class="radio-area muted">#<?= intval($r['pair_id']) ?></div>
+                                <div class="text-area"><?= h($r['right_text']) ?></div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
 
-            <div class="actions-row">
+                <div style="margin-top:12px;">
+                    <div class="small">Match answers by selecting the right option for each question:</div>
+                    <form method="post" style="margin-top:8px">
+                        <input type="hidden" name="action" value="submit_attempt">
+                        <input type="hidden" name="quiz_id" value="<?= intval($quiz_id) ?>">
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+                            <div>
+                                <div class="small" style="margin-bottom:6px"><strong>Question</strong></div>
+                                <?php foreach ($pairs as $left): ?>
+                                    <div style="padding:8px;border:1px solid #eef2ff;border-radius:6px;margin-bottom:8px">
+                                        <div><?= h($left['left_text']) ?></div>
+                                        <div style="margin-top:6px" class="muted">Select matching answer:</div>
+                                        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+                                            <?php foreach ($shuffled_right as $r): ?>
+                                                <label style="display:flex;align-items:center;gap:6px">
+                                                    <input type="radio" name="choice_left_<?= intval($left['pair_id']) ?>" value="<?= intval($r['pair_id']) ?>" required>
+                                                    <span style="font-size:0.95rem"><?= h($r['right_text']) ?></span>
+                                                </label>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+
+                            <div>
+                                <div class="small" style="margin-bottom:6px"><strong>Answers (for reference)</strong></div>
+                                <?php foreach ($shuffled_right as $r): ?>
+                                    <div style="padding:8px;border:1px solid #eef2ff;border-radius:6px;margin-bottom:8px"><?= h($r['right_text']) ?></div>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+
+                        <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+                            <?php if ($user_id && $editing_quiz && $editing_quiz['user_id'] == $user_id): ?>
+                                <a class="btn btn-ghost" href="index.php?quiz_id=<?= intval($quiz_id) ?>&mode=edit">Edit</a>
+                            <?php endif; ?>
+                            <button type="submit" class="btn btn-primary">Done</button>
+                        </div>
+                    </form>
+                </div>
+
+            <?php else: ?>
+                <!-- CREATE or EDIT MODE: show pairs in 50/50 columns with add/remove -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                    <div class="small"><?= $mode === 'edit' ? 'Edit Pairs' : 'Create Pairs' ?></div>
+                    <button class="btn btn-ghost" id="addPairBtn" type="button">+ Add Pair</button>
+                </div>
+
+                <form id="pairsForm" method="post" form="mainForm">
+                    <div id="pairsContainer">
+                        <?php
+                        // if editing, use $pairs; if create default, create 3 blank pair rows
+                        $initial = (!empty($pairs)) ? $pairs : [
+                            ['pair_id' => '', 'left_text' => '', 'right_text' => ''],
+                            ['pair_id' => '', 'left_text' => '', 'right_text' => ''],
+                            ['pair_id' => '', 'left_text' => '', 'right_text' => ''],
+                        ];
+                        foreach ($initial as $idx => $p):
+                        ?>
+                        <div class="pair-row" data-index="<?= $idx ?>">
+                            <input type="hidden" name="pair_id[]" value="<?= h($p['pair_id'] ?? '') ?>">
+                            <input type="text" name="left[]" maxlength="100" placeholder="Question (left) - max 100 chars" value="<?= h($p['left_text'] ?? '') ?>">
+                            <input type="text" name="right[]" maxlength="100" placeholder="Answer (right) - max 100 chars" value="<?= h($p['right_text'] ?? '') ?>">
+                            <button type="button" class="btn btn-ghost removePairBtn">Remove</button>
+                        </div>
+                        <?php endforeach; ?>
+                    </div>
+                </form>
+            <?php endif; ?>
+        </div>
+
+        <!-- Row 5: Add Button (hidden in view) -->
+        <div class="row add-row" style="<?= $mode === 'view' ? 'display:none' : '' ?>">
+            <div class="muted">Use the Add Pair button to add more matching pairs.</div>
+        </div>
+
+        <!-- Row 6: Actions -->
+        <div class="row actions-row">
+            <?php if ($mode === 'view'): ?>
                 <div>
-                    <?php if ($mode !== 'view'): ?>
-                        <label>
-                            <input type="checkbox" name="is_private" <?php echo ($quiz_data['is_public'] == 0) ? 'checked' : ''; ?>> 
-                            Private
-                        </label>
-                    <?php elseif ($mode === 'view' && $is_logged_in && $quiz_data['user_id'] == $current_user_id): ?>
-                         <a href="index.php?quiz_id=<?php echo $quiz_data['quiz_id']; ?>&mode=edit" class="btn btn-edit">Edit Quiz</a>
+                    <?php if ($editing_quiz && $user_id && $editing_quiz['user_id'] == $user_id): ?>
+                        <!-- Creator -->
+                        <a class="btn btn-ghost" href="index.php?quiz_id=<?= intval($quiz_id) ?>&mode=edit">Edit</a>
                     <?php endif; ?>
                 </div>
 
-                <div style="display:flex; gap:10px;">
-                    <?php if ($mode === 'create'): ?>
-                        <button type="submit" class="btn btn-save">Save Quiz</button>
-                    
-                    <?php elseif ($mode === 'edit'): ?>
-                        <a href="index.php?quiz_id=<?php echo $quiz_data['quiz_id']; ?>&mode=view" class="btn btn-take">Take Quiz</a>
-                        <button type="submit" class="btn btn-save">Save Changes</button>
-                    
-                    <?php elseif ($mode === 'view'): ?>
-                        <button type="button" class="btn btn-done" onclick="calculateScore()">Done</button>
-                    <?php endif; ?>
+                <div class="muted">
+                    <?php if (isset($_GET['msg'])) echo h($_GET['msg']); ?>
                 </div>
-            </div>
-        </form>
-    </div>
 
-    <script>
-        function addNewPair() {
-            const wrapper = document.getElementById('pairs-wrapper');
-            const div = document.createElement('div');
-            div.className = 'pair-row';
-            div.innerHTML = `
-                <input type="text" name="left_text[]" class="input-q" placeholder="Question (Left)" maxlength="100" required>
-                <input type="text" name="right_text[]" class="input-a" placeholder="Answer (Right)" maxlength="100" required>
-                <button type="button" onclick="this.parentElement.remove()" style="background:#e74c3c; color:white; border:none; padding:5px 10px; cursor:pointer;">X</button>
-            `;
-            wrapper.appendChild(div);
+            <?php elseif ($mode === 'edit'): ?>
+                <div style="display:flex;gap:12px;align-items:center">
+                    <label class="checkbox"><input type="checkbox" name="is_public" value="1" form="mainForm" <?= (!empty($editing_quiz) && $editing_quiz['is_public']) ? 'checked' : '' ?>> Public</label>
+                </div>
+
+                <div style="display:flex;gap:8px">
+                    <a class="btn btn-ghost" href="index.php?quiz_id=<?= intval($quiz_id) ?>&mode=view">Take Quiz</a>
+                    <button class="btn btn-primary" form="mainForm" type="submit">Save</button>
+                </div>
+
+            <?php else: // create mode ?>
+                <div style="display:flex;gap:12px;align-items:center">
+                    <label class="checkbox"><input type="checkbox" name="is_public" value="1" form="mainForm"> Public</label>
+                </div>
+
+                <div>
+                    <button class="btn btn-primary" type="submit" form="mainForm">Save</button>
+                </div>
+            <?php endif; ?>
+        </div>
+    </main>
+</div>
+
+<script>
+// Dynamic add/remove pair rows
+(function(){
+    const addBtn = document.getElementById('addPairBtn');
+    const container = document.getElementById('pairsContainer');
+    addBtn && addBtn.addEventListener('click', () => {
+        const idx = container.children.length;
+        const div = document.createElement('div');
+        div.className = 'pair-row';
+        div.setAttribute('data-index', idx);
+        div.innerHTML = `
+            <input type="hidden" name="pair_id[]" value="">
+            <input type="text" name="left[]" maxlength="100" placeholder="Question (left) - max 100 chars">
+            <input type="text" name="right[]" maxlength="100" placeholder="Answer (right) - max 100 chars">
+            <button type="button" class="btn btn-ghost removePairBtn">Remove</button>
+        `;
+        container.appendChild(div);
+    });
+
+    document.addEventListener('click', function(e){
+        if (e.target && e.target.classList.contains('removePairBtn')){
+            const el = e.target.closest('.pair-row');
+            el && el.remove();
         }
+    });
 
-        // Taking Quiz Logic
-        let currentLeft = null;
-        let matches = {}; // { left_id: right_id }
-
-        function handleMatchSelect(side, id) {
-            if (side === 'L') {
-                // Clear previous Left selection visuals
-                document.querySelectorAll('.left-item').forEach(el => el.classList.remove('selected-match'));
-                currentLeft = id;
-                document.getElementById('L_' + id).classList.add('selected-match');
-            } else if (side === 'R') {
-                if (currentLeft !== null) {
-                    // Form a match
-                    matches[currentLeft] = id;
-                    
-                    // Visual feedback: Color both green to indicate locked match
-                    document.getElementById('L_' + currentLeft).style.backgroundColor = '#dff0d8';
-                    document.getElementById('R_' + id).style.backgroundColor = '#dff0d8';
-                    
-                    // Reset current selection
-                    currentLeft = null;
-                    
-                    // Uncheck radios to allow correction if needed? 
-                    // For simple logic, we just visually lock them.
-                } else {
-                    alert("Please select a question from the left column first.");
-                    // Uncheck this radio
-                    document.querySelector(`input[name="match_right"][value="${id}"]`).checked = false;
-                }
+    // prevent mainForm default submit if Save is pressed and no pairs
+    const mainForm = document.getElementById('mainForm');
+    mainForm && mainForm.addEventListener('submit', function(e){
+        // Check pairs; only for create/edit saving
+        const action = this.querySelector('input[name="action"]').value;
+        if (action === 'save_new' || action === 'save_edit') {
+            const lefts = document.querySelectorAll('input[name="left[]"]');
+            let valid = false;
+            lefts.forEach((i) => { if (i.value.trim() !== '') valid = true; });
+            if (!valid) {
+                e.preventDefault();
+                alert('Add at least one pair before saving.');
             }
         }
+    });
 
-        function calculateScore() {
-            // In a real app, this would submit to PHP. 
-            // Here we just count matches for demonstration since PHP checking logic wasn't explicitly detailed in the row specs besides DB schema.
-            
-            // To properly check, we need the answer key.
-            // Since we shuffled in PHP, JS doesn't strictly know the correct pairs without hidden fields.
-            // For this UI demo, we will simply alert completion.
-            
-            let count = Object.keys(matches).length;
-            if(count === 0) {
-                alert("You haven't matched anything yet!");
-            } else {
-                alert("Quiz Finished! You matched " + count + " pairs.");
-                window.location.reload();
-            }
-        }
-    </script>
+})();
+</script>
+
+<?php if (isset($error)): ?>
+    <script>console.error(<?= json_encode($error) ?>); alert(<?= json_encode($error) ?>);</script>
+<?php endif; ?>
+
 </body>
 </html>
