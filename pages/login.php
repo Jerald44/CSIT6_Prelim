@@ -230,7 +230,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 <body>
     <div class="login-container">
         <div class="logo">
-            <h1>Quiz System</h1>
+            <h1>Matching Type Test</h1>
             <p>Login to access your account</p>
         </div>
         

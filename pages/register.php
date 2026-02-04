@@ -383,18 +383,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         <?php endif; ?>
         
         <form method="POST" action="" id="registerForm">
-            <div class="form-group">
-                <label for="role_id">Role *</label>
-                <select id="role_id" name="role_id" required>
-                    <option value="">-- Select Role --</option>
-                    <?php foreach ($roles as $role): ?>
-                        <option value="<?php echo $role['role_id']; ?>" 
-                                <?php echo (isset($_POST['role_id']) && $_POST['role_id'] == $role['role_id']) ? 'selected' : ''; ?>>
-                            <?php echo htmlspecialchars(ucfirst($role['role_name'])); ?>
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
+            
+            <input type="hidden" name="role_id" value="2">
             
             <div class="form-group">
                 <label for="username">Username *</label>
